@@ -149,3 +149,107 @@ func doMap2[K comparable, V any](input map[K]V, results map[K]V, f func(context.
 		return nil
 	}, opts...)
 }
+
+// Stream concurrently transforms an input sequence into an output sequence.
+//
+// The order of the output sequence is non-deterministic. Items are delivered as they finish.
+//
+// Parameters:
+//   - parent: The parent nursery that will manage the stream's lifecycle
+//   - inputs: The input sequence to be transformed
+//   - transform: Function that converts each input item to an output item
+//   - opts: Optional configuration for the nested nursery
+//
+// Returns:
+//   - An iterator sequence that yields transformed items as they complete
+//
+// Example:
+//
+//	_ = Block(func(n Nursery) error {
+//		inputs := slices.Values([]int{1, 2, 3, 4, 5})
+//		outputs := conc.Stream(n, inputs, func(_ context.Context, i int) (string, error) {
+//			return fmt.Sprintf("item-%d", i), nil
+//		})
+//
+//		for output := range outputs {
+//			fmt.Println(output)
+//		}
+//	})
+//
+// Within the parent nursery, a goroutine is launched, which in turn creates a nested nursery.
+// The sequence is processed entirely within this nested nursery, and the provided block
+// options are passed to that nursery. This allows each stream to have separate goroutine
+// limits, contexts, etc. By default, however, the nested nursery will use the parent nursery
+// as its context.
+//
+// Error handling: If the transform function returns an error for any input item, that error
+// is propagated to the parent nursery, but the stream continues processing other items until
+// the parent context is canceled.
+//
+// This function uses an unbuffered channel for outputs, but includes context cancellation handling
+// to prevent goroutines from blocking indefinitely. If the nursery's context is cancelled
+// (e.g., via timeout or explicit cancellation), any blocked goroutines will detect this and
+// terminate gracefully.
+//
+// However, if you stop consuming from the output sequence before it's fully drained (e.g.,
+// breaking out of the range loop early) without cancelling the context, the transformation
+// goroutines may still block. To handle this case, you can either:
+//
+// 1. Cancel the context when you're done consuming (recommended)
+//
+// 2. Drain the remaining outputs in a separate goroutine.
+func Stream[I any, O any](
+	parent Nursery,
+	inputs iter.Seq[I],
+	transform func(context.Context, I) (O, error),
+	opts ...BlockOption,
+) iter.Seq[O] {
+	outputs := make(chan O)
+	allOpts := append([]BlockOption{WithContext(parent)}, opts...)
+	parent.Go(func() error {
+		err := Block(
+			func(stream Nursery) error {
+			processing:
+				for input := range inputs {
+					input := input
+					select {
+					case <-stream.Done():
+						break processing
+					default:
+					}
+					stream.Go(func() error {
+						output, err := transform(stream, input)
+						if err != nil {
+							return err
+						}
+						select {
+						case outputs <- output:
+						case <-stream.Done():
+							return stream.Err()
+						}
+						return nil
+					})
+				}
+				return nil
+			},
+			allOpts...,
+		)
+		close(outputs)
+		if err != nil {
+			return err
+		}
+		return parent.Err()
+	})
+	return chanSeq(outputs)
+}
+
+// chanSeq returns an iterator that yields the values of ch until it is closed.
+func chanSeq[T any](ch <-chan T) iter.Seq[T] {
+	return func(yield func(T) bool) {
+		for v := range ch {
+			if !yield(v) {
+				return
+			}
+		}
+	}
+}
