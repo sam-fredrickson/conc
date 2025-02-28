@@ -3,6 +3,7 @@ package conc
 import (
 	"context"
 	"iter"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -148,4 +149,52 @@ func doMap2[K comparable, V any](input map[K]V, results map[K]V, f func(context.
 
 		return nil
 	}, opts...)
+}
+
+// Stream concurrently transforms an input sequence into an output sequence.
+//
+// The order of the output sequence is non-deterministic. Items are delivered as they finish.
+func Stream[I any, O any](
+	n Nursery,
+	inputs iter.Seq[I],
+	transform func(I) (O, error),
+) iter.Seq[O] {
+	outputs := make(chan O)
+	n.Go(func() error {
+		var pending sync.WaitGroup
+	processing:
+		for input := range inputs {
+			select {
+			case <-n.Done():
+				break processing
+			default:
+			}
+			input := input
+
+			pending.Add(1)
+			n.Go(func() error {
+				defer pending.Done()
+				output, err := transform(input)
+				if err == nil {
+					outputs <- output
+				}
+				return err
+			})
+		}
+		pending.Wait()
+		close(outputs)
+		return nil
+	})
+	return chanSeq(outputs)
+}
+
+// chanSeq returns an iterator that yields the values of ch until it is closed.
+func chanSeq[T any](ch <-chan T) iter.Seq[T] {
+	return func(yield func(T) bool) {
+		for v := range ch {
+			if !yield(v) {
+				return
+			}
+		}
+	}
 }
