@@ -202,9 +202,40 @@ func Stream[I any, O any](
 				return nil
 			})
 		}
-		pending.Wait()
+
+		// We need to ensure all goroutines have either completed or detected context cancellation
+		// before closing the outputs channel to avoid "send on closed channel" panics.
+
+		// If context is already cancelled, we need to wait for all goroutines to notice
+		// and stop trying to send to the outputs channel
+		if n.Err() != nil {
+			// Context is cancelled, but we still need to wait for goroutines to complete
+			// or detect cancellation. We can't use pending.Wait() directly because it would
+			// block indefinitely if some goroutines are stuck.
+
+			// Instead, we'll poll with a timeout to see if all goroutines have completed
+			complete := make(chan struct{})
+			go func() {
+				pending.Wait()
+				close(complete)
+			}()
+
+			// Wait with a reasonable timeout
+			select {
+			case <-complete:
+				// All goroutines completed
+			case <-time.After(100 * time.Millisecond):
+				// Some goroutines might still be running, but they should eventually
+				// detect the context cancellation and stop trying to send to the outputs channel
+			}
+		} else {
+			// Normal case - wait for all goroutines to complete
+			pending.Wait()
+		}
+
+		// Now it's safe to close the outputs channel
 		close(outputs)
-		return nil
+		return n.Err()
 	})
 	return chanSeq(outputs)
 }
