@@ -341,4 +341,71 @@ func TestStream(t *testing.T) {
 			t.Errorf("expected to consume exactly 3 outputs, got %d", consumedCount.Load())
 		}
 	})
+
+	t.Run("SafeEarlyTerminationWithDefer", func(t *testing.T) {
+		// This test demonstrates the recommended pattern for safely handling early termination
+		// using a defer to ensure the channel is always drained
+		inputs := []int{1, 2, 3, 4, 5}
+		var processedCount atomic.Int32
+		var consumedCount atomic.Int32
+
+		err := Block(func(n Nursery) error {
+			outputs := Stream(
+				n,
+				slices.Values(inputs),
+				func(i int) (int, error) {
+					processedCount.Add(1)
+					// Simulate work
+					time.Sleep(1 * time.Millisecond)
+					return i, nil
+				},
+			)
+
+			// Set up a deferred drain to handle early returns or breaks
+			drainStarted := false
+			defer func() {
+				if !drainStarted {
+					n.Go(func() error {
+						// Drain any remaining outputs
+						for range outputs {
+							// Discard remaining outputs
+						}
+						return nil
+					})
+				}
+			}()
+
+			// Process outputs until some condition
+			for output := range outputs {
+				consumedCount.Add(1)
+				_ = output
+
+				// Simulate early termination after consuming 3 outputs
+				if consumedCount.Load() >= 3 {
+					drainStarted = true
+					go func() {
+						// Drain remaining outputs
+						for range outputs {
+							// Discard remaining outputs
+						}
+					}()
+					break
+				}
+			}
+
+			return nil
+		})
+
+		if err != nil {
+			t.Error(err)
+		}
+
+		if processedCount.Load() != int32(len(inputs)) {
+			t.Errorf("expected all %d inputs to be processed, got %d", len(inputs), processedCount.Load())
+		}
+
+		if consumedCount.Load() != 3 {
+			t.Errorf("expected to consume exactly 3 outputs, got %d", consumedCount.Load())
+		}
+	})
 }

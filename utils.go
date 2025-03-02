@@ -154,6 +154,18 @@ func doMap2[K comparable, V any](input map[K]V, results map[K]V, f func(context.
 // Stream concurrently transforms an input sequence into an output sequence.
 //
 // The order of the output sequence is non-deterministic. Items are delivered as they finish.
+//
+// Stream uses an unbuffered channel for outputs, but includes context cancellation handling
+// to prevent goroutines from blocking indefinitely. If the nursery's context is cancelled
+// (e.g., via timeout or explicit cancellation), any blocked goroutines will detect this and
+// terminate gracefully.
+//
+// However, if you stop consuming from the output sequence before it's fully drained (e.g.,
+// breaking out of the range loop early) without cancelling the context, the transformation
+// goroutines may still block. To handle this case, you can either:
+//
+// 1. Cancel the context when you're done consuming (recommended)
+// 2. Drain the remaining outputs in a separate goroutine.
 func Stream[I any, O any](
 	n Nursery,
 	inputs iter.Seq[I],
