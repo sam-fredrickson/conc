@@ -187,10 +187,19 @@ func Stream[I any, O any](
 			n.Go(func() error {
 				defer pending.Done()
 				output, err := transform(input)
-				if err == nil {
-					outputs <- output
+				if err != nil {
+					return err
 				}
-				return err
+
+				// Use select to avoid blocking indefinitely if context is cancelled
+				select {
+				case outputs <- output:
+					// Successfully sent output
+				case <-n.Done():
+					// Context cancelled, stop sending
+					return n.Err()
+				}
+				return nil
 			})
 		}
 		pending.Wait()

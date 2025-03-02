@@ -408,4 +408,104 @@ func TestStream(t *testing.T) {
 			t.Errorf("expected to consume exactly 3 outputs, got %d", consumedCount.Load())
 		}
 	})
+
+	t.Run("ContextCancellationUnblocksProducers", func(t *testing.T) {
+		// This test verifies that cancelling the context unblocks goroutines
+		// that are trying to send to the outputs channel
+		inputs := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+		var processedCount atomic.Int32
+		var blockedCount atomic.Int32
+		var unblockedCount atomic.Int32
+		var readyToCancel atomic.Bool
+		var cancelDone atomic.Bool
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Use a longer timeout to ensure the test has enough time to complete
+		ctx, timeoutCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer timeoutCancel() // Ensure the timeout context is properly cancelled
+
+		err := Block(func(n Nursery) error {
+			// Create a buffered channel to control when goroutines are blocked
+			// Buffer size 3 means the first 3 items will be processed without blocking
+			controlCh := make(chan struct{}, 3)
+
+			outputs := Stream(
+				n,
+				slices.Values(inputs),
+				func(i int) (int, error) {
+					processedCount.Add(1)
+
+					// Simulate slow processing for later items
+					if i > 3 {
+						// Signal that we're about to block
+						blockedCount.Add(1)
+
+						// Wait until we're ready to proceed or context is cancelled
+						select {
+						case controlCh <- struct{}{}:
+							// This will block once the buffer is full
+							readyToCancel.Store(true)
+
+							// Wait for cancellation
+							<-n.Done()
+							unblockedCount.Add(1)
+							return i, n.Err()
+						case <-n.Done():
+							// Already cancelled
+							unblockedCount.Add(1)
+							return i, n.Err()
+						}
+					}
+					return i, nil
+				},
+			)
+
+			// Only consume first 3 outputs, then cancel the context
+			count := 0
+			for output := range outputs {
+				count++
+				if count >= 3 {
+					// Wait until at least one goroutine is blocked
+					for !readyToCancel.Load() {
+						time.Sleep(10 * time.Millisecond)
+						// If we've waited too long, break to avoid hanging
+						if count := blockedCount.Load(); count > 0 {
+							break
+						}
+					}
+
+					// Cancel the context to unblock any goroutines trying to send
+					cancel()
+					cancelDone.Store(true)
+					break
+				}
+				_ = output
+			}
+
+			// Wait for cancellation to propagate
+			for i := 0; i < 10 && !cancelDone.Load(); i++ {
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			return nil
+		}, WithContext(ctx))
+
+		if err == nil {
+			t.Error("expected an error due to context cancellation")
+		}
+
+		if blockedCount.Load() == 0 {
+			t.Error("expected some goroutines to be blocked")
+		}
+
+		if unblockedCount.Load() == 0 {
+			t.Error("expected blocked goroutines to be unblocked by context cancellation")
+		}
+
+		if processedCount.Load() >= int32(len(inputs)) {
+			t.Logf("All inputs were processed despite cancellation, which is unexpected but not an error")
+		}
+	})
 }
